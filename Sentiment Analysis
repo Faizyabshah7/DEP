@@ -1,0 +1,1177 @@
+!cd "/content/drive/MyDrive/TER BERTTweet"
+
+CUDA_LAUNCH_BLOCKING="1"
+
+# Commented out IPython magic to ensure Python compatibility.
+"""
+!git clone https://github.com/huggingface/transformers.git
+# %cd transformers/
+!pip3 install --upgrade .
+"""
+
+!pip3 install emoji
+!pip install transformers sentencepiece
+
+def writeResultsInFile(accuracy, f1_score, random_seed):
+    f = open("log", "a")
+    f.write(f'Random seed : {random_seed}, accuracy : {accuracy}, f1-score : {f1_score}')
+    f.close()
+
+#imports hugging face
+from transformers import AutoModel, AutoTokenizer
+
+bertweet = AutoModel.from_pretrained("vinai/bertweet-base")
+tokenizer = AutoTokenizer.from_pretrained("vinai/bertweet-base", normalization = True, use_fast=False)
+
+#imports hugging face
+from transformers import AutoModel, AutoTokenizer
+
+bertweet = AutoModel.from_pretrained("vinai/bertweet-base")
+tokenizer = AutoTokenizer.from_pretrained("vinai/bertweet-base", normalization = True, use_fast=False)
+
+# Commented out IPython magic to ensure Python compatibility.
+import transformers
+import torch
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from pylab import rcParams
+import matplotlib.pyplot as plt
+from matplotlib import rc
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, classification_report, recall_score, f1_score, accuracy_score, average_precision_score
+from collections import defaultdict
+from textwrap import wrap
+from torch import nn, optim
+from torch.utils.data import Dataset, DataLoader
+# %matplotlib inline
+
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+torch.manual_seed(RANDOM_SEED)
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+class SATweetDataset(Dataset):
+
+  def __init__(self, tweets, targets, tokenizer, max_len):
+    self.tweets = tweets
+    self.targets = targets
+    self.tokenizer = tokenizer
+    self.max_len = max_len
+
+  def __len__(self):
+    return len(self.tweets)
+
+  def __getitem__(self, item):
+    tweet = str(self.tweets[item])
+    target = self.targets[item]
+
+    encoding = self.tokenizer.encode_plus(
+      tweet,
+      add_special_tokens=True,
+      max_length=self.max_len,
+      truncation= True,
+      return_token_type_ids=False,
+      padding = 'max_length',
+      return_attention_mask=True,
+      return_tensors='pt',
+    )
+
+    return {
+      'tweet_text': tweet,
+      'input_ids': encoding['input_ids'].flatten(),
+      'attention_mask': encoding['attention_mask'].flatten(),
+      'targets': torch.tensor(target, dtype=torch.long)
+    }
+
+def create_data_loader(df, tokenizer, max_len, batch_size):
+
+    ds = SATweetDataset(
+        tweets=df.body.to_numpy(),
+        targets=df.target.to_numpy(),
+        tokenizer=tokenizer,
+        max_len=max_len
+    )
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        num_workers=4
+    )
+
+PRE_TRAINED_MODEL_NAME = "vinai/bertweet-base"
+
+class SentimentClassifier(nn.Module):
+
+  def __init__(self, n_classes):
+    super(SentimentClassifier, self).__init__()
+    self.bert = bertweet.from_pretrained(PRE_TRAINED_MODEL_NAME)
+    #self.drop = nn.Dropout(p = 0.33)
+    self.out = nn.Linear(self.bert.config.hidden_size, n_classes)
+
+  def forward(self, input_ids, attention_mask):
+    _, pooled_output = self.bert(
+      input_ids=input_ids,
+      attention_mask=attention_mask,
+      return_dict=False
+    )
+    #output = self.drop(pooled_output)
+    output = pooled_output
+    return self.out(output)
+
+def train_epoch(model, data_loader, loss_fn, optimizer,  device, n_examples):
+  model = model.train()
+  losses = []
+  correct_predictions = 0
+
+  for d in data_loader:
+    input_ids = d["input_ids"].to(device)
+    attention_mask = d["attention_mask"].to(device)
+    targets = d["targets"].to(device)
+
+    outputs = model(
+      input_ids=input_ids,
+      attention_mask=attention_mask
+    )
+
+    _, preds = torch.max(outputs, dim=1)
+    loss = loss_fn(outputs, targets)
+
+    correct_predictions += torch.sum(preds == targets)
+    losses.append(loss.item())
+
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+
+  return correct_predictions.double() / n_examples, np.mean(losses)
+
+def eval_model(model, data_loader, loss_fn, device, n_examples):
+  model = model.eval()
+
+  losses = []
+  correct_predictions = 0
+
+  with torch.no_grad():
+    for d in data_loader:
+      input_ids = d["input_ids"].to(device)
+      attention_mask = d["attention_mask"].to(device)
+      targets = d["targets"].to(device)
+
+      outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask
+      )
+      _, preds = torch.max(outputs, dim=1)
+
+      loss = loss_fn(outputs, targets)
+
+      correct_predictions += torch.sum(preds == targets)
+      losses.append(loss.item())
+
+  return correct_predictions.double() / n_examples, np.mean(losses)
+
+def get_predictions(model, data_loader):
+  model = model.eval()
+
+  tweets_content = []
+  predictions = []
+  prediction_probs = []
+  real_values = []
+
+  with torch.no_grad():
+    for d in data_loader:
+
+      texts = d["tweet_text"]
+      input_ids = d["input_ids"].to(device)
+      attention_mask = d["attention_mask"].to(device)
+      targets = d["targets"].to(device)
+
+      outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask
+      )
+
+      _, preds = torch.max(outputs, dim=1)
+
+      probs = nn.functional.softmax(outputs, dim=1)
+
+      tweets_content.extend(texts)
+      predictions.extend(preds)
+      prediction_probs.extend(probs)
+      real_values.extend(targets)
+
+  predictions = torch.stack(predictions).cpu()
+  prediction_probs = torch.stack(prediction_probs).cpu()
+  real_values = torch.stack(real_values).cpu()
+  return tweets_content, predictions, prediction_probs, real_values
+
+def show_confusion_matrix(confusion_matrix):
+  hmap = sns.heatmap(confusion_matrix, annot=True, fmt="d", cmap="Blues")
+  hmap.yaxis.set_ticklabels(hmap.yaxis.get_ticklabels(), rotation=0, ha='right')
+  hmap.xaxis.set_ticklabels(hmap.xaxis.get_ticklabels(), rotation=30, ha='right')
+  plt.ylabel('True sentiment')
+  plt.xlabel('Predicted sentiment');
+
+def avg_rec(y_test, y_pred):
+    rec_n, rec_u, rec_p = recall_score(y_test, y_pred, average=None)
+    return (1/3) * (rec_n+ rec_u+ rec_p)
+
+def f1_np(y_test, y_pred):
+    f1_n, _,f1_p = f1_score(y_test, y_pred, average=None)
+    return 0.5*(f1_n+f1_p)
+
+"""####SemEval-2018Task3A"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %cd '/content/drive/MyDrive/TER BERTTweet/SemEval-2018Task3A/datasets'
+
+df_semEval18_train = pd.read_csv('train/SemEval2018-T3-train-taskA_emoji.txt', skiprows=[0], names = ['id', 'target', 'body'], sep = "\t")
+df_semEval18_test = pd.read_csv('goldtest_TaskA/SemEval2018-T3_gold_test_taskA_emoji.txt', skiprows=[0], names = ['id', 'target', 'body'], sep = "\t")
+df_semEval18_train
+
+df_semEval18_train['target'] = df_semEval18_train['target'].astype(int)
+
+df_semEval18_test['target'] = df_semEval18_test['target'].astype(int)
+
+token_lens = []
+for txt in df_semEval18_train.body:
+  tokens = tokenizer.encode(txt, max_length=128)
+  token_lens.append(len(tokens))
+
+sns.histplot(token_lens)
+plt.xlim([0, 256]);
+plt.xlabel('Token count');
+
+MAX_LEN = max(token_lens)
+BATCH_SIZE = 32
+
+MAX_LEN
+
+RANDOM_SEED = 1993
+df_train, df_val = train_test_split(df_semEval18_train, test_size=0.1, random_state=RANDOM_SEED)
+df_test = df_semEval18_test
+
+train_data_loader = create_data_loader(df_train, tokenizer, MAX_LEN, BATCH_SIZE)
+val_data_loader = create_data_loader(df_val, tokenizer, MAX_LEN, BATCH_SIZE)
+test_data_loader = create_data_loader(df_test, tokenizer, MAX_LEN, BATCH_SIZE)
+
+data = next(iter(train_data_loader))
+data.keys()
+
+data = next(iter(val_data_loader))
+data.keys()
+
+n_classes = 2
+class_names = ['ironic', 'non-ironic']
+
+input_ids = data['input_ids'].to(device)
+attention_mask = data['attention_mask'].to(device)
+
+print(input_ids.shape) # batch size x seq length
+print(attention_mask.shape) # batch size x seq length
+
+model = SentimentClassifier(n_classes)
+model = model.to(device)
+
+EPOCHS = 30
+
+optimizer = optim.AdamW(model.parameters(), lr=1e-5)
+total_steps = len(train_data_loader) * EPOCHS
+"""
+scheduler = transformers.get_linear_schedule_with_warmup(
+  optimizer,
+  num_warmup_steps=0,
+  num_training_steps=total_steps
+)
+"""
+loss_fn = nn.CrossEntropyLoss().to(device)
+
+# Commented out IPython magic to ensure Python compatibility.
+# %%time
+# 
+# history = defaultdict(list)
+# best_accuracy = 0
+# early_stop = 0
+# 
+# for epoch in range(EPOCHS):
+# 
+#   print(f'Epoch {epoch + 1}/{EPOCHS}')
+#   print('-' * 10)
+# 
+#   train_acc, train_loss = train_epoch(
+#     model,
+#     train_data_loader,
+#     loss_fn,
+#     optimizer,
+#     device,
+#     len(df_train)
+#   )
+# 
+#   print(f'Train loss {train_loss} accuracy {train_acc}')
+# 
+#   val_acc, val_loss = eval_model(
+#     model,
+#     val_data_loader,
+#     loss_fn,
+#     device,
+#     len(df_val)
+#   )
+# 
+#   print(f'Val   loss {val_loss} accuracy {val_acc}')
+#   print()
+# 
+#   history['train_acc'].append(train_acc)
+#   history['train_loss'].append(train_loss)
+#   history['val_acc'].append(val_acc)
+#   history['val_loss'].append(val_loss)
+# 
+#   if val_acc > best_accuracy:
+#     torch.save(model.state_dict(), 'bertweet_best_model_state.bin')
+#     best_accuracy = val_acc
+#     early_stop = 0
+#   else:
+#       early_stop = early_stop + 1
+#       if early_stop == 5:
+#         break
+
+model.load_state_dict(torch.load('bertweet_best_model_state.bin'))
+
+test_data_loader = create_data_loader(df_test, tokenizer, MAX_LEN, BATCH_SIZE)
+
+test_acc, _ = eval_model(
+  model,
+  test_data_loader,
+  loss_fn,
+  device,
+  len(df_test)
+)
+
+test_acc.item()
+
+y_tweet_texts, y_pred, y_pred_probs, y_test = get_predictions(
+  model,
+  test_data_loader
+)
+
+print(classification_report(y_test, y_pred, target_names=class_names))
+
+cm = confusion_matrix(y_test, y_pred)
+df_cm = pd.DataFrame(cm, index=class_names, columns=class_names)
+show_confusion_matrix(df_cm)
+
+accuracy_score(y_test, y_pred)
+
+_,f1_p = f1_score(y_test, y_pred, average=None)
+
+print(f1_p)
+
+
+
+"""###SemEval 2019 TASK 5"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %cd '/content/drive/MyDrive/TER BERTTweet/SemEval2019Task5/datasets'
+
+!ls
+
+df_semEval19_train = pd.read_csv('hateval2019_en_train.csv', sep = ",")
+#df_semEval19_train_val = pd.read_csv('hateval2019_en_dev.csv', sep = "\t")
+df_semEval19_valid = pd.read_csv('hateval2019_en_dev.csv',  sep = ",")
+df_test_gold = pd.read_csv('hateval2019_en_test.csv', sep = ",")
+#df_result = pd.read_csv('en_a.tsv', sep = "\t", names=["id", "target"])
+#df_test_gold = pd.concat([df_semEval19_test, df_result.target], axis=1)
+
+df_test_gold
+
+df_train = df_semEval19_train.drop(columns=['TR', 'AG']).rename(columns = {"text" : "body", "HS" : "target"})
+#df_train_val = df_semEval19_train_val.drop(columns=['TR', 'AG']).rename(columns = {"text" : "body", "HS" : "target"})
+df_val = df_semEval19_valid.drop(columns=['TR', 'AG']).rename(columns = {"text" : "body", "HS" : "target"})
+df_test = df_test_gold.drop(columns=['TR', 'AG']).rename(columns = {"text" : "body", "HS" : "target"})
+
+df_train
+
+df_train_val = pd.concat([df_train, df_val], axis = 0)
+df_train_val
+
+RANDOM_SEED = 16
+df_train, df_val = train_test_split(df_train_val, test_size=0.1, random_state=RANDOM_SEED)
+
+token_lens = []
+for txt in df_train.body:
+  tokens = tokenizer.encode(txt, max_length=128)
+  token_lens.append(len(tokens))
+
+sns.histplot(token_lens)
+plt.xlim([0, 128]);
+plt.xlabel('Token count');
+
+MAX_LEN = np.max(token_lens)
+BATCH_SIZE = 32
+
+train_data_loader = create_data_loader(df_train, tokenizer, MAX_LEN, BATCH_SIZE)
+val_data_loader = create_data_loader(df_val, tokenizer, MAX_LEN, BATCH_SIZE)
+
+data = next(iter(train_data_loader))
+data.keys()
+
+data = next(iter(val_data_loader))
+data.keys()
+
+n_classes = 2
+class_names = ['hateful', 'non-hateful']
+
+input_ids = data['input_ids'].to(device)
+attention_mask = data['attention_mask'].to(device)
+
+print(input_ids.shape) # batch size x seq length
+print(attention_mask.shape) # batch size x seq length
+
+model = SentimentClassifier(n_classes)
+model = model.to(device)
+
+EPOCHS = 30
+
+optimizer = optim.AdamW(model.parameters(), lr=1e-5)
+total_steps = len(train_data_loader) * EPOCHS
+
+scheduler = transformers.get_linear_schedule_with_warmup(
+  optimizer,
+  num_warmup_steps=0,
+  num_training_steps=total_steps
+)
+
+loss_fn = nn.CrossEntropyLoss().to(device)
+
+# Commented out IPython magic to ensure Python compatibility.
+# %%time
+# 
+# history = defaultdict(list)
+# best_accuracy = 0
+# early_stop = 0
+# 
+# for epoch in range(EPOCHS):
+# 
+#   print(f'Epoch {epoch + 1}/{EPOCHS}')
+#   print('-' * 10)
+# 
+#   train_acc, train_loss = train_epoch(
+#     model,
+#     train_data_loader,
+#     loss_fn,
+#     optimizer,
+#     device,
+#     len(df_train)
+#   )
+# 
+#   print(f'Train loss {train_loss} accuracy {train_acc}')
+# 
+#   val_acc, val_loss = eval_model(
+#     model,
+#     val_data_loader,
+#     loss_fn,
+#     device,
+#     len(df_val)
+#   )
+# 
+#   print(f'Val   loss {val_loss} accuracy {val_acc}')
+#   print()
+# 
+#   history['train_acc'].append(train_acc)
+#   history['train_loss'].append(train_loss)
+#   history['val_acc'].append(val_acc)
+#   history['val_loss'].append(val_loss)
+# 
+#   if val_acc > best_accuracy:
+#     torch.save(model.state_dict(), 'best_model_state.bin')
+#     best_accuracy = val_acc
+#     early_stop = 0
+#   else:
+#       early_stop = early_stop + 1
+#       if early_stop == 5:
+#         break
+
+model.load_state_dict(torch.load('best_model_state.bin'))
+
+test_data_loader = create_data_loader(df_test, tokenizer, MAX_LEN, BATCH_SIZE)
+
+test_acc, _ = eval_model(
+  model,
+  test_data_loader,
+  loss_fn,
+  device,
+  len(df_test)
+)
+
+test_acc.item()
+
+y_tweet_texts, y_pred, y_pred_probs, y_test = get_predictions(
+  model,
+  test_data_loader
+)
+
+print(classification_report(y_test, y_pred, target_names=class_names))
+
+cm = confusion_matrix(y_test, y_pred)
+df_cm = pd.DataFrame(cm, index=class_names, columns=class_names)
+show_confusion_matrix(df_cm)
+
+
+
+accuracy_score(y_test, y_pred)
+
+f1_score(y_test, y_pred)
+
+df_test["y_pred"] = y_pred
+
+df_test.to_csv("bertweet_preds.csv", sep="\t")
+
+"""##SemEval 2016 Task 6"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %cd "/content/drive/MyDrive/TER BERTTweet/SemEval2016Task6"
+
+!ls -l
+
+df_sem16train = pd.read_csv("semeval2016-task6-trainingdata.txt", sep="\t", encoding = "ISO-8859-1")
+df_sem16val = pd.read_csv("semeval2016-task6-trialdata.txt", sep="\t", encoding = "ISO-8859-1")
+df_sem16test = pd.read_csv("SemEval2016-Task6-subtaskA-testdata-gold.txt", sep="\t", encoding = "ISO-8859-1")
+
+df_sem16train.Tweet[0]
+
+df_sem16train["Stance"].unique()
+
+df_sem16train["Target"].unique()
+
+df_sem16train["Target"] = df_sem16train["Target"].astype('category')
+df_sem16train['target'] = df_sem16train['Target'].cat.codes
+
+df_train = df_sem16train[["Tweet", "Stance"]]
+df_val = df_sem16val[["Tweet", "Stance"]]
+
+df_train = df_val.append(df_train)
+
+df_train
+
+df_val
+
+def sentiment_encode(sentiment):
+  if sentiment == 'AGAINST':
+    return 0
+  elif sentiment == 'NONE':
+    return 1
+  else:
+    return 2
+
+df_train['target'] = df_train.Stance.apply(sentiment_encode)
+
+class_names = ['negative', 'neutral', 'positive']
+
+df_train = df_train.rename(columns={'Tweet' : 'body'});
+
+df_test = df_sem16test
+df_test['target'] = df_test.Stance.apply(sentiment_encode)
+df_test = df_test.rename(columns={'Tweet' : 'body'});
+
+RANDOM_SEED = 42
+df_train, df_val = train_test_split(df_train, test_size=0.1, random_state=RANDOM_SEED)
+
+df_train
+
+token_lens = []
+for txt in df_train.body:
+  tokens = tokenizer.encode(txt, max_length=128)
+  token_lens.append(len(tokens))
+
+sns.histplot(token_lens)
+plt.xlim([0, 128]);
+plt.xlabel('Token count');
+
+MAX_LEN = np.max(token_lens)
+BATCH_SIZE = 32
+
+train_data_loader = create_data_loader(df_train, tokenizer, MAX_LEN, BATCH_SIZE)
+val_data_loader = create_data_loader(df_val, tokenizer, MAX_LEN, BATCH_SIZE)
+
+data = next(iter(train_data_loader))
+data.keys()
+
+data = next(iter(val_data_loader))
+data.keys()
+
+n_classes = 3
+class_names = ['postive', 'negative', 'neutral']
+
+input_ids = data['input_ids'].to(device)
+attention_mask = data['attention_mask'].to(device)
+
+print(input_ids.shape) # batch size x seq length
+print(attention_mask.shape) # batch size x seq length
+
+model = SentimentClassifier(n_classes)
+model = model.to(device)
+
+EPOCHS = 30
+
+optimizer = optim.AdamW(model.parameters(), lr=1e-5)
+total_steps = len(train_data_loader) * EPOCHS
+
+scheduler = transformers.get_linear_schedule_with_warmup(
+  optimizer,
+  num_warmup_steps=0,
+  num_training_steps=total_steps
+)
+
+loss_fn = nn.CrossEntropyLoss().to(device)
+
+# Commented out IPython magic to ensure Python compatibility.
+# %%time
+# 
+# history = defaultdict(list)
+# best_accuracy = 0
+# early_stop = 0
+# 
+# for epoch in range(EPOCHS):
+# 
+#   print(f'Epoch {epoch + 1}/{EPOCHS}')
+#   print('-' * 10)
+# 
+#   train_acc, train_loss = train_epoch(
+#     model,
+#     train_data_loader,
+#     loss_fn,
+#     optimizer,
+#     device,
+#     len(df_train)
+#   )
+# 
+#   print(f'Train loss {train_loss} accuracy {train_acc}')
+# 
+#   val_acc, val_loss = eval_model(
+#     model,
+#     val_data_loader,
+#     loss_fn,
+#     device,
+#     len(df_val)
+#   )
+# 
+#   print(f'Val   loss {val_loss} accuracy {val_acc}')
+#   print()
+# 
+#   history['train_acc'].append(train_acc)
+#   history['train_loss'].append(train_loss)
+#   history['val_acc'].append(val_acc)
+#   history['val_loss'].append(val_loss)
+# 
+#   if val_acc > best_accuracy:
+#     torch.save(model.state_dict(), 'best_model_state.bin')
+#     best_accuracy = val_acc
+#     early_stop = 0
+#   else:
+#       early_stop = early_stop + 1
+#       if early_stop == 5:
+#         break
+
+model.load_state_dict(torch.load('best_model_state.bin'))
+
+df_sem16test.Tweet[0]
+
+test_data_loader = create_data_loader(df_test, tokenizer, MAX_LEN, BATCH_SIZE)
+
+test_acc, _ = eval_model(
+  model,
+  test_data_loader,
+  loss_fn,
+  device,
+  len(df_test)
+)
+
+test_acc.item()
+
+y_tweet_texts, y_pred, y_pred_probs, y_test = get_predictions(
+  model,
+  test_data_loader
+)
+
+print(classification_report(y_test, y_pred, target_names=class_names))
+
+cm = confusion_matrix(y_test, y_pred)
+df_cm = pd.DataFrame(cm, index=class_names, columns=class_names)
+show_confusion_matrix(df_cm)
+
+accuracy_score(y_test, y_pred)
+
+f1_score(y_test, y_pred, average='weighted')
+
+writeResultsInFile(accuracy_score(y_test, y_pred), f1_score(y_test, y_pred, average='weighted'), random_seed=RANDOM_SEED)
+
+"""## SemEval2020Task9"""
+
+# Commented out IPython magic to ensure Python compatibility.
+
+# %cd "/content/drive/MyDrive/TER BERTTweet/SemEval2020Task9"
+
+!ls
+
+df_train = pd.read_csv("TrainV1.tsv.txt", sep="\t", header=None,  names=['id', 'body', 'target'])
+df_val = pd.read_csv("ValidationV1.tsv.txt", sep="\t", header=None,  names=['id', 'body', 'target'])
+df_test = pd.read_csv("FinalTest.tsv.txt", sep="\t", header=None,  names=['id', 'body'])
+df_ytest = pd.read_csv("test_labels_hinglish.txt", sep=",", header=0, names=['id', 'sentiment'])
+
+df_train = df_val.append(df_train)
+
+df_test = df_test.merge(df_ytest)
+
+
+
+RANDOM_SEED = 16
+df_train, df_val = train_test_split(df_train, test_size=0.1, random_state=RANDOM_SEED)
+
+df_train = df_train.dropna()
+
+df_train['target'].unique()
+
+token_lens = []
+for txt in df_train.body:
+  tokens = tokenizer.encode(txt, max_length=128)
+  token_lens.append(len(tokens))
+
+sns.histplot(token_lens)
+plt.xlim([0, 128]);
+plt.xlabel('Token count');
+
+MAX_LEN = np.max(token_lens)
+BATCH_SIZE = 32
+
+train_data_loader = create_data_loader(df_train, tokenizer, MAX_LEN, BATCH_SIZE)
+val_data_loader = create_data_loader(df_val, tokenizer, MAX_LEN, BATCH_SIZE)
+
+data = next(iter(train_data_loader))
+data.keys()
+
+data = next(iter(val_data_loader))
+data.keys()
+
+n_classes = 3
+class_names = ['postive', 'neutral', 'negative']
+
+input_ids = data['input_ids'].to(device)
+attention_mask = data['attention_mask'].to(device)
+
+print(input_ids.shape) # batch size x seq length
+print(attention_mask.shape) # batch size x seq length
+
+model = SentimentClassifier(n_classes)
+model = model.to(device)
+
+EPOCHS = 30
+
+optimizer = optim.AdamW(model.parameters(), lr=1e-5)
+total_steps = len(train_data_loader) * EPOCHS
+
+scheduler = transformers.get_linear_schedule_with_warmup(
+  optimizer,
+  num_warmup_steps=0,
+  num_training_steps=total_steps
+)
+
+loss_fn = nn.CrossEntropyLoss().to(device)
+
+# Commented out IPython magic to ensure Python compatibility.
+# %%time
+# 
+# history = defaultdict(list)
+# best_accuracy = 0
+# early_stop = 0
+# 
+# for epoch in range(EPOCHS):
+# 
+#   print(f'Epoch {epoch + 1}/{EPOCHS}')
+#   print('-' * 10)
+# 
+#   train_acc, train_loss = train_epoch(
+#     model,
+#     train_data_loader,
+#     loss_fn,
+#     optimizer,
+#     device,
+#     len(df_train)
+#   )
+# 
+#   print(f'Train loss {train_loss} accuracy {train_acc}')
+# 
+#   val_acc, val_loss = eval_model(
+#     model,
+#     val_data_loader,
+#     loss_fn,
+#     device,
+#     len(df_val)
+#   )
+# 
+#   print(f'Val   loss {val_loss} accuracy {val_acc}')
+#   print()
+# 
+#   history['train_acc'].append(train_acc)
+#   history['train_loss'].append(train_loss)
+#   history['val_acc'].append(val_acc)
+#   history['val_loss'].append(val_loss)
+# 
+#   if val_acc > best_accuracy:
+#     torch.save(model.state_dict(), 'best_model_state.bin')
+#     best_accuracy = val_acc
+#     early_stop = 0
+#   else:
+#       early_stop = early_stop + 1
+#       if early_stop == 5:
+#         break
+
+model.load_state_dict(torch.load('best_model_state.bin'))
+
+def sentiment_encode(sentiment):
+  if sentiment == 'negative':
+    return 0
+  elif sentiment == 'neutral':
+    return 1
+  else:
+    return 2
+
+df_test['target'] = df_test.sentiment.apply(sentiment_encode)
+
+test_data_loader = create_data_loader(df_test, tokenizer, MAX_LEN, BATCH_SIZE)
+
+test_acc, _ = eval_model(
+  model,
+  test_data_loader,
+  loss_fn,
+  device,
+  len(df_test)
+)
+
+test_acc.item()
+
+y_tweet_texts, y_pred, y_pred_probs, y_test = get_predictions(
+  model,
+  test_data_loader
+)
+
+print(classification_report(y_test, y_pred, target_names=class_names))
+
+cm = confusion_matrix(y_test, y_pred)
+df_cm = pd.DataFrame(cm, index=class_names, columns=class_names)
+show_confusion_matrix(df_cm)
+
+accuracy_score(y_test, y_pred)
+
+f1_score(y_test, y_pred, average='weighted')
+
+"""## SemEval 2019 task 6
+
+"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %cd /content/drive/MyDrive/TER BERTTweet/SemEval2019Task6
+
+!ls
+
+df_train = pd.read_csv("olid-training-v1.0.tsv", sep="\t", header=0,  names=['id', 'body', 'target', 'dropme', 'dropme2'])
+df_test = pd.read_csv("testset-levela.tsv", sep="\t", header=0,  names=['id', 'body'])
+df_ytest = pd.read_csv("labels-levela.csv", sep=",", header=0, names=['id', 'sentiment'])
+
+df_test = df_test.merge(df_ytest)
+
+df_train
+
+df_test
+
+df_train['target'].unique()
+
+def sentiment_encode(sentiment):
+  if sentiment == 'OFF':
+    return 0
+  elif sentiment == 'NOT':
+    return 1
+
+df_train['target'] = df_train.target.apply(sentiment_encode)
+
+RANDOM_SEED = 22
+df_train, df_val = train_test_split(df_train, test_size=0.1, random_state=RANDOM_SEED)
+
+token_lens = []
+for txt in df_train.body:
+  tokens = tokenizer.encode(txt, max_length=128)
+  token_lens.append(len(tokens))
+
+sns.histplot(token_lens)
+plt.xlim([0, 128]);
+plt.xlabel('Token count');
+
+MAX_LEN = np.max(token_lens)
+BATCH_SIZE = 32
+
+train_data_loader = create_data_loader(df_train, tokenizer, MAX_LEN, BATCH_SIZE)
+val_data_loader = create_data_loader(df_val, tokenizer, MAX_LEN, BATCH_SIZE)
+
+data = next(iter(train_data_loader))
+data.keys()
+
+data = next(iter(val_data_loader))
+data.keys()
+
+n_classes = 2
+class_names = ['offensive', 'not_offensive']
+
+input_ids = data['input_ids'].to(device)
+attention_mask = data['attention_mask'].to(device)
+
+print(input_ids.shape) # batch size x seq length
+print(attention_mask.shape) # batch size x seq length
+
+model = SentimentClassifier(n_classes)
+model = model.to(device)
+
+EPOCHS = 30
+
+optimizer = optim.AdamW(model.parameters(), lr=1e-5)
+total_steps = len(train_data_loader) * EPOCHS
+
+scheduler = transformers.get_linear_schedule_with_warmup(
+  optimizer,
+  num_warmup_steps=0,
+  num_training_steps=total_steps
+)
+
+loss_fn = nn.CrossEntropyLoss().to(device)
+
+# Commented out IPython magic to ensure Python compatibility.
+# %%time
+# 
+# history = defaultdict(list)
+# best_accuracy = 0
+# early_stop = 0
+# 
+# for epoch in range(EPOCHS):
+# 
+#   print(f'Epoch {epoch + 1}/{EPOCHS}')
+#   print('-' * 10)
+# 
+#   train_acc, train_loss = train_epoch(
+#     model,
+#     train_data_loader,
+#     loss_fn,
+#     optimizer,
+#     device,
+#     len(df_train)
+#   )
+# 
+#   print(f'Train loss {train_loss} accuracy {train_acc}')
+# 
+#   val_acc, val_loss = eval_model(
+#     model,
+#     val_data_loader,
+#     loss_fn,
+#     device,
+#     len(df_val)
+#   )
+# 
+#   print(f'Val   loss {val_loss} accuracy {val_acc}')
+#   print()
+# 
+#   history['train_acc'].append(train_acc)
+#   history['train_loss'].append(train_loss)
+#   history['val_acc'].append(val_acc)
+#   history['val_loss'].append(val_loss)
+# 
+#   if val_acc > best_accuracy:
+#     torch.save(model.state_dict(), 'best_model_state.bin')
+#     best_accuracy = val_acc
+#     early_stop = 0
+#   else:
+#       early_stop = early_stop + 1
+#       if early_stop == 5:
+#         break
+
+model.load_state_dict(torch.load('best_model_state.bin'))
+
+df_test['target'] = df_test.sentiment.apply(sentiment_encode)
+
+test_data_loader = create_data_loader(df_test, tokenizer, MAX_LEN, BATCH_SIZE)
+
+test_acc, _ = eval_model(
+  model,
+  test_data_loader,
+  loss_fn,
+  device,
+  len(df_test)
+)
+
+test_acc.item()
+
+y_tweet_texts, y_pred, y_pred_probs, y_test = get_predictions(
+  model,
+  test_data_loader
+)
+
+print(classification_report(y_test, y_pred, target_names=class_names))
+
+cm = confusion_matrix(y_test, y_pred)
+df_cm = pd.DataFrame(cm, index=class_names, columns=class_names)
+show_confusion_matrix(df_cm)
+
+accuracy_score(y_test, y_pred)
+
+f1_score(y_test, y_pred, average='weighted')
+
+"""##SemEval 2020 Task 12"""
+
+# Commented out IPython magic to ensure Python compatibility.
+# %cd /content/drive/MyDrive/TER BERTTweet/SemEval2020Task12
+
+!ls
+
+df_train = pd.read_csv("task_a_distant.tsv", sep="\t", header=0,  names=['id', 'body', 'target'])
+df_test = pd.read_csv("test_a_tweets_all.tsv", sep="\t", header=0,  names=['id', 'body'])
+df_ytest = pd.read_csv("test_a_labels_all.csv", sep=",", header=0, names=['id', 'sentiment'])
+
+df_test = df_test.merge(df_ytest)
+
+df_train
+
+df_test
+
+df_train['target'].unique()
+
+def sentiment_encode(sentiment):
+  if sentiment == 'OFF':
+    return 0
+  elif sentiment == 'NOT':
+    return 1
+
+df_train['target'] = df_train.target.apply(sentiment_encode)
+
+RANDOM_SEED = 16
+df_train, df_val = train_test_split(df_train, test_size=0.1, random_state=RANDOM_SEED)
+
+token_lens = []
+for txt in df_train.body:
+  tokens = tokenizer.encode(txt, max_length=128)
+  token_lens.append(len(tokens))
+
+sns.histplot(token_lens)
+plt.xlim([0, 128]);
+plt.xlabel('Token count');
+
+MAX_LEN = np.max(token_lens)
+BATCH_SIZE = 32
+
+train_data_loader = create_data_loader(df_train, tokenizer, MAX_LEN, BATCH_SIZE)
+val_data_loader = create_data_loader(df_val, tokenizer, MAX_LEN, BATCH_SIZE)
+
+data = next(iter(train_data_loader))
+data.keys()
+
+data = next(iter(val_data_loader))
+data.keys()
+
+n_classes = 2
+class_names = ['offensive', 'not_offensive']
+
+input_ids = data['input_ids'].to(device)
+attention_mask = data['attention_mask'].to(device)
+
+print(input_ids.shape) # batch size x seq length
+print(attention_mask.shape) # batch size x seq length
+
+model = SentimentClassifier(n_classes)
+model = model.to(device)
+
+EPOCHS = 30
+
+optimizer = optim.AdamW(model.parameters(), lr=1e-5)
+total_steps = len(train_data_loader) * EPOCHS
+
+scheduler = transformers.get_linear_schedule_with_warmup(
+  optimizer,
+  num_warmup_steps=0,
+  num_training_steps=total_steps
+)
+
+loss_fn = nn.CrossEntropyLoss().to(device)
+
+# Commented out IPython magic to ensure Python compatibility.
+# %%time
+# 
+# history = defaultdict(list)
+# best_accuracy = 0
+# early_stop = 0
+# 
+# for epoch in range(EPOCHS):
+# 
+#   print(f'Epoch {epoch + 1}/{EPOCHS}')
+#   print('-' * 10)
+# 
+#   train_acc, train_loss = train_epoch(
+#     model,
+#     train_data_loader,
+#     loss_fn,
+#     optimizer,
+#     device,
+#     len(df_train)
+#   )
+# 
+#   print(f'Train loss {train_loss} accuracy {train_acc}')
+# 
+#   val_acc, val_loss = eval_model(
+#     model,
+#     val_data_loader,
+#     loss_fn,
+#     device,
+#     len(df_val)
+#   )
+# 
+#   print(f'Val   loss {val_loss} accuracy {val_acc}')
+#   print()
+# 
+#   history['train_acc'].append(train_acc)
+#   history['train_loss'].append(train_loss)
+#   history['val_acc'].append(val_acc)
+#   history['val_loss'].append(val_loss)
+# 
+#   if val_acc > best_accuracy:
+#     torch.save(model.state_dict(), 'best_model_state.bin')
+#     best_accuracy = val_acc
+#     early_stop = 0
+#   else:
+#       early_stop = early_stop + 1
+#       if early_stop == 5:
+#         break
+
+model.load_state_dict(torch.load('best_model_state.bin'))
+
+df_test['target'] = df_test.sentiment.apply(sentiment_encode)
+
+test_data_loader = create_data_loader(df_test, tokenizer, MAX_LEN, BATCH_SIZE)
+
+test_acc, _ = eval_model(
+  model,
+  test_data_loader,
+  loss_fn,
+  device,
+  len(df_test)
+)
+
+test_acc.item()
+
+y_tweet_texts, y_pred, y_pred_probs, y_test = get_predictions(
+  model,
+  test_data_loader
+)
+
+print(classification_report(y_test, y_pred, target_names=class_names))
+
+cm = confusion_matrix(y_test, y_pred)
+df_cm = pd.DataFrame(cm, index=class_names, columns=class_names)
+show_confusion_matrix(df_cm)
+
+accuracy_score(y_test, y_pred)
+
+f1_score(y_test, y_pred, average='weighted')
+
