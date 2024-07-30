@@ -1,0 +1,62 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+
+
+data = pd.read_csv('/kaggle/input/network-traffic-data-for-intrusion-detection/network_traffic_data.csv')
+
+data.head()
+
+data.isnull().sum
+
+
+label_encoders = {}
+for column in data.select_dtypes(include=['object']).columns:
+    le = LabelEncoder()
+    data[column] = le.fit_transform(data[column])
+    label_encoders[column] = le
+    
+    
+data.head()
+
+
+# Check if 'Label' column exists in the DataFrame
+if 'Label' in data.columns:
+    x = data.drop('Label', axis=1)
+    y = data['Label']
+else:
+    print("Error: 'Label' column not found in the DataFrame.")
+
+
+# Splitting the data into training and testing sets
+x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.2, random_state=42)
+
+# Reshaping the data to ensure it's 2D
+
+x_train_reshaped = x_train.values.reshape(-1, 1)
+x_test_reshaped = x_test.values.reshape(-1, 1)
+
+
+# Standardizing the features using StandardScaler
+scaler = StandardScaler()
+x_train_scaled = scaler.fit_transform(x_train_reshaped)
+x_test_scaled = scaler.transform(x_test_reshaped) 
+
+
+
+#training model
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, accuracy_score
+
+
+model =  RandomForestClassifier(n_estimators=100, random_state=42)
+
+model.fit(x_train,y_train)
+
+y_pred = model.predict(x_test)
+
+accuracy =  accuracy_score(y_test,y_pred)
+
+print(f'accuracy score of model is {accuracy}')
