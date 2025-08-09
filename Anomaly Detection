@@ -8,7 +8,7 @@ data = pd.read_csv('/kaggle/input/network-traffic-data-for-intrusion-detection/n
 
 data.head()
 
-data.isnull().sum
+data.isnull().sum // data is null
 
 
 label_encoders = {}
